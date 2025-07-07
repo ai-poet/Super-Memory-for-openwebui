@@ -1,0 +1,529 @@
+"""
+title: 超级记忆助手 v4.7
+description: 
+1.自动分析存储记忆，分为fact模式（即直接提取需要记忆的事实写入记忆）和summary模式（以ai自己的视角总结记忆写入）。
+2.为每一条新存入的记忆，都打上一个精确到分钟的时间戳，让ai知道每段记忆记住的时间。
+3.定期后台自动生成记忆摘要，将零碎记忆合并为一个完整的记忆模块
+4.可以自动更新记忆，拥有查重功能，不会重复记忆已有的事实
+5.全面的性能数据：完整展示每一次对话的首字时间显示、总耗时、AI的生成速度 (TPS) 和输出的Token数
+author: 南风 
+version: 4.7
+required_open_webui_version: >= 0.5.0
+"""
+
+# ==================== 导入必要的库 ====================
+import json
+import asyncio
+import time
+import datetime
+import re
+import random
+from typing import Optional, Callable, Awaitable, Any, List
+
+import pytz
+import aiohttp
+from fastapi.requests import Request
+from pydantic import BaseModel, Field
+
+from open_webui.main import app as webui_app
+from open_webui.models.users import Users
+from open_webui.routers.memories import (
+    add_memory,
+    AddMemoryForm,
+    query_memory,
+    QueryMemoryForm,
+    delete_memory_by_id,
+)
+from open_webui.utils.misc import get_last_assistant_message
+
+# ==================== 提示词库 ====================
+# ... (提示词内容与之前版本相同，为节省空间已折叠) ...
+FACT_EXTRACTION_PROMPT = """你正在帮助维护用户的“记忆”——就像一个个独立的“日记条目”。你将收到最近几条对话。你的任务是判断用户的【最新一条】消息中，有哪些细节值得作为“记忆”被长期保存。【核心指令】1.  **只分析用户最新一条消息**：仅从用户的最新发言中识别新的或变更的个人信息。旧消息仅供理解上下文。2.  **处理信息变更**：如果用户最新消息与旧信息冲突，只提取更新后的信息。3.  **事实独立**：每条记忆都应是独立的“事实”。如果一句话包含多个信息点，请拆分。4.  **提取有价值信息**：目标是捕捉任何有助于AI在未来提供更个性化服务的信息。5.  **响应明确指令**：如果用户明确要求“记住”，必须提取该信息。6.  **忽略短期信息**：不要记录临时或无意义的细节。7.  **指定格式返回**：将结果以【JSON字符串数组】的格式返回。如无信息，【只】返回空数组（`[]`）。不要加任何解释。---### 【示例】**示例 1**_输入对话:_- user: ```我爱吃橘子```- assistant: ```太棒了！```- user: ```其实我讨厌吃橘子```_正确输出:_["用户讨厌吃橘子"]**示例 2**_输入对话:_- user: ```我是一名初级数据分析师。请记住我的重要汇报在3月15日。```_正确输出:_["用户是一名初级数据分析师", "用户在3月15日有一次重要汇报"]"""
+SUMMARY_CREATION_PROMPT = """你是AI助手，任务是为一段对话生成简洁的摘要，作为长期记忆。【指令】1. **视角**: 以第一人称（“我”或“我们”）总结。2. **内容**: 捕捉核心要点：用户意图、你的关键回答、双方共识。3. **格式**: **必须**是单一段落的文本。4. **目标**: 如果对话有实质内容，则创建记忆。否则，返回空字符串。"""
+SUMMARY_UPDATE_PROMPT = """你的任务是根据最新的对话内容，更新一段已有的记忆摘要。【指令】1. 你将收到【旧的摘要】和【新的对话内容】。2. 将新对话中的【核心信息】无缝地融入到旧摘要中。3. 保持第一人称视角。4. **必须**返回一个更新后的、完整的、单一段落的摘要文本。【旧的摘要】:{existing_summary}【新的对话内容】:{new_conversation}"""
+FACT_CONSOLIDATION_PROMPT = """你正在管理用户的“记忆”。你的任务是清理一个可能包含相关、重叠或冲突信息的记忆列表。**【处理规则】**1. 你将收到一个JSON格式的记忆列表，每条含“fact”和“created_at”时间戳。2. 生成一个清理后的最终事实列表，确保： - 只在记忆**完全重复**或就同一主题**直接冲突**时才合并。 - 如果重复或冲突，**只保留`created_at`最新的那一条**。 - 如果部分相似但不冲突（例如“用户喜欢橘子”和“用户喜欢熟透的橘子”），则**两者都保留**。3. 返回最终结果时，使用一个简单的【JSON字符串数组】格式。不要添加任何解释。---### 【示例】_输入 (JSON数组):_`[{"fact": "用户最喜欢的颜色是青色", "created_at": 1635500000}, {"fact": "用户最喜欢的颜色是红色", "created_at": 1636000000}]`_正确输出 (JSON字符串数组):_["用户最喜欢的颜色是红色"]"""
+MEMORY_SUMMARIZATION_PROMPT = """你是一个记忆摘要助手。你的任务是将关于一个用户的多条相关但零散的记忆，合并成一个简洁、全面、高质量的摘要。**【核心指令】**1.  **整合信息**：捕获所有输入记忆中的关键信息点。2.  **解决冲突**：如果信息有矛盾，优先采纳时间戳最新的信息。3.  **消除冗余**：去除重复或无意义的细节。4.  **保持精华**：保留用户的核心偏好、身份特征、重要目标和关系。5.  **自然流畅**：最终输出的摘要应该像一段自然语言，而不是一个列表。6.  **格式要求**：【必须】只返回一个单一段落的文本摘要。不要加任何解释或多余的文字。**【示例】**_输入的多条记忆:_- "2024年05月10日11点：用户喜欢喝咖啡"- "2024年05月12日15点：用户偏好美式咖啡"- "2024年05月20日09点：用户提到他每天早上都要喝一杯咖啡提神"_正确的输出摘要:_"用户是一个咖啡爱好者，每天早上习惯喝一杯美式咖啡来提神。"现在，请分析以下的相关记忆，并提供一个简洁、高质量的摘要。"""
+
+
+# ==================== 主类定义 ====================
+class Filter:
+    _embedding_model = None
+    _background_tasks = set()
+
+    @classmethod
+    def get_embedding_model(cls):
+        # ... (懒加载模型的代码保持不变) ...
+        if cls._embedding_model is None:
+            try:
+                print("Attempting to load SentenceTransformer model...")
+                from sentence_transformers import SentenceTransformer
+
+                cls._embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+                print("Embedding model loaded successfully.")
+            except ImportError:
+                print(
+                    "ERROR: sentence-transformers or numpy not installed. Please run 'pip install sentence-transformers numpy'"
+                )
+                return None
+            except Exception as e:
+                print(f"Error loading embedding model: {e}")
+                return None
+        return cls._embedding_model
+
+    class Valves(BaseModel):
+        # ... (配置与v4.6一致) ...
+        enabled: bool = Field(default=True, description="【总开关】启用/禁用本插件")
+        memory_mode: str = Field(
+            default="fact",
+            description="记忆模式: 'fact' (提取事实) 或 'summary' (对话总结)",
+        )
+        api_url: str = Field(
+            default="https://api.openai.com/v1/chat/completions",
+            description="API端点地址 (必须包含/v1/chat/completions)",
+        )
+        api_key: str = Field(default="", description="【重要】API密钥")
+        model: str = Field(default="gpt-4o-mini", description="用于记忆处理的模型")
+        show_stats: bool = Field(default=True, description="在状态栏显示性能与记忆统计")
+        messages_to_consider: int = Field(default=6, description="纳入分析的消息数量")
+        timezone: str = Field(
+            default="Asia/Shanghai", description="【时间修正】用于生成时间戳的时区"
+        )
+        enable_semantic_search: bool = Field(
+            default=False, description="【高级功能/可选】启用语义搜索"
+        )
+        similarity_threshold: float = Field(
+            default=0.8, description="记忆去重/更新的相似度阈值"
+        )
+        consolidation_threshold: float = Field(
+            default=0.75,
+            description="【记忆整合】查找相关旧记忆以进行整合的相似度阈值 (0-1)",
+        )
+        enable_background_summarization: bool = Field(
+            default=True, description="【后台任务】是否启用后台记忆自动摘要与整合"
+        )
+        summarization_interval_hours: float = Field(
+            default=2.0, description="【后台任务】每隔多少小时执行一次摘要任务"
+        )
+        summarization_cluster_threshold: float = Field(
+            default=0.7, description="【后台任务】判断记忆属于同一簇的相似度阈值"
+        )
+        summarization_min_cluster_size: int = Field(
+            default=3, description="【后台任务】形成一个簇所需的最少记忆数量"
+        )
+        summarization_min_memory_age_days: int = Field(
+            default=7, description="【后台任务】只对多少天以前的旧记忆进行摘要"
+        )
+
+    def __init__(self):
+        self.valves = self.Valves()
+        self.start_time = None
+        # 改造一：重新加入用于计算首字时间的变量
+        self.time_to_first_token = None
+        self.first_chunk_received = False
+        if self.valves.enable_background_summarization:
+            task = asyncio.create_task(self._summarize_memories_loop())
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+            print("Background memory summarization task started.")
+
+    def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
+        self.start_time = time.time()
+        # 重置首字时间状态
+        self.time_to_first_token = None
+        self.first_chunk_received = False
+        return body
+
+    # 改造一(续)：重新加入 stream 函数
+    def stream(self, event: dict) -> dict:
+        if not self.first_chunk_received:
+            self.time_to_first_token = time.time() - self.start_time
+            self.first_chunk_received = True
+        return event
+
+    async def outlet(
+        self,
+        body: dict,
+        __event_emitter__: Callable[[Any], Awaitable[None]],
+        __user__: Optional[dict] = None,
+    ):
+        # ... (outlet函数保持不变) ...
+        if not self.valves.enabled or not __user__ or len(body.get("messages", [])) < 2:
+            return body
+        user = Users.get_user_by_id(__user__["id"])
+        try:
+            if self.valves.memory_mode == "fact":
+                memory_result = await self._handle_fact_mode(body, user)
+            elif self.valves.memory_mode == "summary":
+                memory_result = await self._handle_summary_mode(body, user)
+            else:
+                memory_result = {"status": "error", "message": "无效的记忆模式"}
+        except Exception as e:
+            print(f"CRITICAL ERROR in outlet: {e}")
+            import traceback
+
+            traceback.print_exc()
+            memory_result = {"status": "error", "message": "插件执行出错"}
+        stats_result = self._calculate_stats(body)
+        if self.valves.show_stats:
+            await self._show_status(__event_emitter__, memory_result, stats_result)
+        return body
+
+    # ... (所有后台任务、记忆处理等核心逻辑函数与 v4.6 完全一致, 此处省略) ...
+    # 为了完整性，粘贴所有函数
+    async def _summarize_memories_loop(self):
+        await asyncio.sleep(300)
+        while True:
+            interval_seconds = self.valves.summarization_interval_hours * 3600
+            print(
+                f"Next background summarization run in {self.valves.summarization_interval_hours} hours."
+            )
+            await asyncio.sleep(interval_seconds)
+            if not self.valves.enable_semantic_search:
+                print("Skipping summarization: Semantic search is disabled in valves.")
+                continue
+            try:
+                all_users = Users.get_users()
+                for user in all_users:
+                    await self._process_user_summarization(user)
+            except Exception as e:
+                print(f"Error in background summarization loop: {e}")
+
+    async def _process_user_summarization(self, user):
+        print(f"Checking memories for user {user.id}...")
+        all_user_memories = await self._query_memories_by_similarity(
+            " ", user, k=1000, threshold=0.0
+        )
+        min_age_seconds = self.valves.summarization_min_memory_age_days * 24 * 3600
+        now_ts = time.time()
+        eligible_memories = [
+            mem
+            for mem in all_user_memories
+            if (now_ts - self._parse_memory_content(mem["content"])[1])
+            > min_age_seconds
+        ]
+        if len(eligible_memories) < self.valves.summarization_min_cluster_size:
+            print(f"User {user.id} has no eligible old memories to summarize.")
+            return
+        clusters, processed_ids = [], set()
+        for mem in eligible_memories:
+            if mem["id"] in processed_ids:
+                continue
+            current_cluster = [mem]
+            processed_ids.add(mem["id"])
+            related_mems = await self._query_memories_by_similarity(
+                mem["content_without_timestamp"],
+                user,
+                k=10,
+                threshold=self.valves.summarization_cluster_threshold,
+            )
+            for related in related_mems:
+                if related["id"] not in processed_ids and related["id"] in [
+                    m["id"] for m in eligible_memories
+                ]:
+                    current_cluster.append(related)
+                    processed_ids.add(related["id"])
+            if len(current_cluster) >= self.valves.summarization_min_cluster_size:
+                clusters.append(current_cluster)
+        if not clusters:
+            print(f"No memory clusters found for user {user.id}.")
+            return
+        print(f"Found {len(clusters)} clusters to summarize for user {user.id}.")
+        for cluster in clusters:
+            try:
+                cluster_content = "\n".join([f"- {m['content']}" for m in cluster])
+                summary_content = await self._call_llm(
+                    MEMORY_SUMMARIZATION_PROMPT, cluster_content
+                )
+                if summary_content:
+                    await self._store_new_memory(summary_content, user, is_summary=True)
+                    for m in cluster:
+                        await delete_memory_by_id(m["id"], user)
+                    print(
+                        f"Successfully summarized {len(cluster)} memories into one for user {user.id}."
+                    )
+            except Exception as e:
+                print(f"Error summarizing a cluster for user {user.id}: {e}")
+
+    async def _handle_fact_mode(self, body: dict, user) -> dict:
+        conversation_text = self._stringify_conversation(body["messages"])
+        if not conversation_text:
+            return {"status": "skipped", "message": "无消息"}
+        try:
+            new_facts = await self._call_llm_for_json(
+                FACT_EXTRACTION_PROMPT, conversation_text
+            )
+            if not new_facts:
+                return {"status": "success", "message": "无新事实"}
+            facts_to_consolidate = []
+            related_memories_to_delete_ids = set()
+            for fact in new_facts:
+                related_memories = await self._query_memories_by_similarity(
+                    fact, user, k=5, threshold=self.valves.consolidation_threshold
+                )
+                consolidation_input = [{"fact": fact, "created_at": time.time()}]
+                for mem in related_memories:
+                    related_memories_to_delete_ids.add(mem["id"])
+                    content, ts = self._parse_memory_content(mem["content"])
+                    consolidation_input.append({"fact": content, "created_at": ts})
+                facts_to_consolidate.append(consolidation_input)
+            final_facts_to_save = []
+            for fact_group in facts_to_consolidate:
+                prompt_input_json = json.dumps(fact_group, ensure_ascii=False)
+                cleaned_facts = await self._call_llm_for_json(
+                    FACT_CONSOLIDATION_PROMPT, prompt_input_json
+                )
+                final_facts_to_save.extend(cleaned_facts)
+            if related_memories_to_delete_ids:
+                print(
+                    f"Consolidating memories, deleting {len(related_memories_to_delete_ids)} old facts..."
+                )
+                for mem_id in related_memories_to_delete_ids:
+                    await delete_memory_by_id(mem_id, user)
+            saved_count = 0
+            for fact in list(set(final_facts_to_save)):
+                await self._store_new_memory(fact, user, is_summary=True)
+                saved_count += 1
+            return {
+                "status": "success",
+                "message": f"记忆整合: 新增{saved_count}条, 清理{len(related_memories_to_delete_ids)}条",
+            }
+        except Exception as e:
+            import traceback
+
+            traceback.print_exc()
+            return {"status": "error", "message": f"事实整合失败: {e}"}
+
+    async def _handle_summary_mode(self, body: dict, user) -> dict:
+        conversation_text = self._stringify_conversation(body["messages"])
+        if not conversation_text:
+            return {"status": "skipped", "message": "无消息"}
+        try:
+            related_summary = await self._find_related_summary(conversation_text, user)
+            if related_summary:
+                updated_summary_content = await self._call_llm(
+                    SUMMARY_UPDATE_PROMPT.format(
+                        existing_summary=related_summary["content_without_timestamp"],
+                        new_conversation=conversation_text,
+                    )
+                )
+                if not updated_summary_content:
+                    return {"status": "skipped", "message": "更新无内容"}
+                await delete_memory_by_id(related_summary["id"], user)
+                content_with_timestamp = self._add_timestamp_to_content(
+                    updated_summary_content
+                )
+                await add_memory(
+                    request=self._get_dummy_request(),
+                    form_data=AddMemoryForm(content=content_with_timestamp),
+                    user=user,
+                )
+                return {"status": "success", "message": "总结已更新"}
+            else:
+                new_summary_content = await self._call_llm(
+                    SUMMARY_CREATION_PROMPT, conversation_text
+                )
+                if not new_summary_content:
+                    return {"status": "success", "message": "无需总结"}
+                await self._store_new_memory(new_summary_content, user, is_summary=True)
+                return {"status": "success", "message": "已创建新总结"}
+        except Exception as e:
+            return {"status": "error", "message": f"总结处理失败: {e}"}
+
+    # 改造三：将时间戳格式精确到分钟
+    def _add_timestamp_to_content(self, content: str) -> str:
+        try:
+            target_tz = pytz.timezone(self.valves.timezone)
+        except pytz.UnknownTimeZoneError:
+            target_tz = pytz.utc
+        now = datetime.datetime.now(target_tz)
+        return f"{now.strftime('%Y年%m月%d日%H点%M分')}：{content}"
+
+    async def _store_new_memory(
+        self, content: str, user, is_summary: bool = False
+    ) -> bool:
+        if not is_summary:
+            is_duplicate = False
+            if self.valves.enable_semantic_search:
+                related_memories = await self._query_memories_by_similarity(
+                    content, user, k=1, threshold=self.valves.similarity_threshold
+                )
+                if related_memories:
+                    is_duplicate = True
+            else:
+                related_memories = await self._query_memories_legacy(content, user, k=1)
+                if (
+                    related_memories
+                    and related_memories[0]["similarity"]
+                    > self.valves.similarity_threshold
+                ):
+                    is_duplicate = True
+            if is_duplicate:
+                return False
+        content_with_timestamp = self._add_timestamp_to_content(content)
+        await add_memory(
+            request=self._get_dummy_request(),
+            form_data=AddMemoryForm(content=content_with_timestamp),
+            user=user,
+        )
+        return True
+
+    # 改造三(续)：修正解析和剥离时间戳的逻辑
+    def _parse_memory_content(self, content: str) -> (str, float):
+        match = re.match(r"^(\d{4}年\d{2}月\d{2}日\d{2}点\d{2}分)：(.*)", content)
+        if match:
+            try:
+                dt_obj = datetime.datetime.strptime(
+                    match.group(1), "%Y年%m月%d日%H点%M分："
+                )
+                return match.group(2), dt_obj.timestamp()
+            except ValueError:
+                return match.group(2), 0
+        return content, 0
+
+    async def _find_related_summary(self, text: str, user) -> Optional[dict]:
+        related_memories = await self._query_memories_by_similarity(
+            text, user, k=1, threshold=self.valves.similarity_threshold
+        )
+        if not related_memories:
+            return None
+        return related_memories[0]
+
+    async def _query_memories_legacy(self, text: str, user, k: int = 1) -> List[dict]:
+        query_result = await query_memory(
+            self._get_dummy_request(), QueryMemoryForm(content=text, k=k), user
+        )
+        if (
+            not query_result
+            or not hasattr(query_result, "documents")
+            or not query_result.documents[0]
+        ):
+            return []
+        results = []
+        for i, doc_content in enumerate(query_result.documents[0]):
+            content_without_timestamp, _ = self._parse_memory_content(doc_content)
+            results.append(
+                {
+                    "id": query_result.metadatas[0][i].get("id"),
+                    "content": doc_content,
+                    "content_without_timestamp": content_without_timestamp,
+                    "similarity": 1 - query_result.distances[0][i],
+                }
+            )
+        return results
+
+    async def _query_memories_by_similarity(
+        self, text: str, user, k: int, threshold: float
+    ) -> List[dict]:
+        if self.valves.enable_semantic_search:
+            return await self._query_memories_semantic(text, user, k, threshold)
+        else:
+            results = await self._query_memories_legacy(text, user, k)
+            return [res for res in results if res["similarity"] > threshold]
+
+    async def _query_memories_semantic(
+        self, text: str, user, k: int = 1, threshold: float = 0.0
+    ) -> List[dict]:
+        model = self.get_embedding_model()
+        if not model:
+            return []
+        import numpy as np
+
+        all_memories_raw = await self._query_memories_legacy(" ", user, k=1000)
+        if not all_memories_raw:
+            return []
+        query_embedding = model.encode(text)
+        results = []
+        for mem in all_memories_raw:
+            mem_embedding = model.encode(mem["content_without_timestamp"])
+            similarity = np.dot(query_embedding, mem_embedding) / (
+                np.linalg.norm(query_embedding) * np.linalg.norm(mem_embedding)
+            )
+            if similarity >= threshold:
+                mem["similarity"] = float(similarity)
+                results.append(mem)
+        results.sort(key=lambda x: x["similarity"], reverse=True)
+        return results[:k]
+
+    async def _call_llm(self, system_prompt: str, user_prompt: str = "") -> str:
+        messages = [{"role": "system", "content": system_prompt}]
+        if user_prompt:
+            messages.append({"role": "user", "content": user_prompt})
+        url = self.valves.api_url
+        headers = {
+            "Authorization": f"Bearer {self.valves.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {"model": self.valves.model, "messages": messages, "temperature": 0.0}
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json=payload) as response:
+                response.raise_for_status()
+                data = await response.json()
+                return data["choices"][0]["message"]["content"].strip()
+
+    async def _call_llm_for_json(
+        self, system_prompt: str, user_prompt: str = ""
+    ) -> List:
+        content = await self._call_llm(system_prompt, user_prompt)
+        try:
+            if content.startswith("```json"):
+                content = content[7:-3].strip()
+            result = json.loads(content)
+            return result if isinstance(result, list) else []
+        except json.JSONDecodeError:
+            return []
+
+    def _stringify_conversation(self, messages: List[dict]) -> str:
+        count = min(self.valves.messages_to_consider, len(messages))
+        return "\n".join(
+            [f"- {msg['role']}: {msg['content']}" for msg in messages[-count:]]
+        )
+
+    # 改造一(续)：修改统计函数，加入首字时间
+    def _calculate_stats(self, body: dict) -> dict:
+        elapsed = time.time() - self.start_time
+        response_msg = get_last_assistant_message(body.get("messages", [])) or ""
+        tokens = len(response_msg) // 3
+        tps = tokens / elapsed if elapsed > 0 else 0
+        return {
+            "elapsed": f"{elapsed:.1f}s",
+            "tokens": tokens,
+            "tps": f"{tps:.0f}",
+            "ttft": (
+                f"{self.time_to_first_token:.2f}s"
+                if self.time_to_first_token is not None
+                else "N/A"
+            ),
+        }
+
+    # 改造二：修改显示函数，调整顺序并增加首字时间
+    async def _show_status(
+        self, event_emitter, memory_result: dict, stats_result: dict
+    ):
+        memory_part = []
+        if memory_result:
+            status, message = memory_result.get("status", "skipped"), memory_result.get(
+                "message", ""
+            )
+            icon = "✅" if status == "success" else "❌" if status == "error" else "🤷"
+            memory_part.append(f" {icon} {message}")
+
+        stats_parts = [
+            f"首字{stats_result['ttft']}",
+            f"用时{stats_result['elapsed']}",
+            f"⚡{stats_result['tps']}Tok/s",
+            f"约{stats_result['tokens']}T",
+        ]
+
+        # 按照您要的顺序组合
+        final_parts = memory_part + stats_parts
+
+        if final_parts:
+            await event_emitter(
+                {
+                    "type": "status",
+                    "data": {"description": " | ".join(final_parts), "done": True},
+                }
+            )
+
+    def _get_dummy_request(self) -> Request:
+        return Request(scope={"type": "http", "app": webui_app})
