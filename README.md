@@ -1,5 +1,4 @@
 # Super-Memory-for-openwebui
-作者：南风的AI进化日记。知乎，b站，抖音同号
 
 超级记忆助手，专为中文用户优化。
 
@@ -21,8 +20,5 @@
 7.记忆的添加，更新状态也会在面板数据那里显示
 <img width="383" alt="{4A894AEB-6AEC-445A-850F-87A6650BFA3B}" src="https://github.com/user-attachments/assets/eea4b152-fa35-4273-bd6d-fbf7a3fa9071" />
 
-使用方法：
-1.openwebui社区链接导入：https://openwebui.com/f/linyou/super_memory
-2.或者您可以点击代码库里面的function，复制，导入到openwebui的函数
-
+8.自动总结并删除老旧的记忆
 
