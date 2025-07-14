@@ -1,13 +1,13 @@
 """
-title: 超级记忆助手 v4.7
-description: 
-1.自动分析存储记忆，分为fact模式（即直接提取需要记忆的事实写入记忆）和summary模式（以ai自己的视角总结记忆写入）。
-2.为每一条新存入的记忆，都打上一个精确到分钟的时间戳，让ai知道每段记忆记住的时间。
-3.定期后台自动生成记忆摘要，将零碎记忆合并为一个完整的记忆模块
-4.可以自动更新记忆，拥有查重功能，不会重复记忆已有的事实
-5.全面的性能数据：完整展示每一次对话的首字时间显示、总耗时、AI的生成速度 (TPS) 和输出的Token数
-author: 南风 
-version: 4.7
+title: 超级记忆助手 v5.1 (带记忆注入)
+description:
+1. 自动分析存储记忆，分为fact模式和summary模式
+2. 为每条记忆打上精确到分钟的时间戳
+3. 自动更新记忆，拥有查重功能
+4. 全面的性能数据展示
+5. 将用户记忆注入到系统提示词中
+6. preserve_min_memory_age_days参数，自动总结并清理旧记忆
+version: 5.1
 required_open_webui_version: >= 0.5.0
 """
 
@@ -17,7 +17,6 @@ import asyncio
 import time
 import datetime
 import re
-import random
 from typing import Optional, Callable, Awaitable, Any, List
 
 import pytz
@@ -27,6 +26,7 @@ from pydantic import BaseModel, Field
 
 from open_webui.main import app as webui_app
 from open_webui.models.users import Users
+from open_webui.models.memories import Memories
 from open_webui.routers.memories import (
     add_memory,
     AddMemoryForm,
@@ -37,22 +37,29 @@ from open_webui.routers.memories import (
 from open_webui.utils.misc import get_last_assistant_message
 
 # ==================== 提示词库 ====================
-# ... (提示词内容与之前版本相同，为节省空间已折叠) ...
-FACT_EXTRACTION_PROMPT = """你正在帮助维护用户的“记忆”——就像一个个独立的“日记条目”。你将收到最近几条对话。你的任务是判断用户的【最新一条】消息中，有哪些细节值得作为“记忆”被长期保存。【核心指令】1.  **只分析用户最新一条消息**：仅从用户的最新发言中识别新的或变更的个人信息。旧消息仅供理解上下文。2.  **处理信息变更**：如果用户最新消息与旧信息冲突，只提取更新后的信息。3.  **事实独立**：每条记忆都应是独立的“事实”。如果一句话包含多个信息点，请拆分。4.  **提取有价值信息**：目标是捕捉任何有助于AI在未来提供更个性化服务的信息。5.  **响应明确指令**：如果用户明确要求“记住”，必须提取该信息。6.  **忽略短期信息**：不要记录临时或无意义的细节。7.  **指定格式返回**：将结果以【JSON字符串数组】的格式返回。如无信息，【只】返回空数组（`[]`）。不要加任何解释。---### 【示例】**示例 1**_输入对话:_- user: ```我爱吃橘子```- assistant: ```太棒了！```- user: ```其实我讨厌吃橘子```_正确输出:_["用户讨厌吃橘子"]**示例 2**_输入对话:_- user: ```我是一名初级数据分析师。请记住我的重要汇报在3月15日。```_正确输出:_["用户是一名初级数据分析师", "用户在3月15日有一次重要汇报"]"""
-SUMMARY_CREATION_PROMPT = """你是AI助手，任务是为一段对话生成简洁的摘要，作为长期记忆。【指令】1. **视角**: 以第一人称（“我”或“我们”）总结。2. **内容**: 捕捉核心要点：用户意图、你的关键回答、双方共识。3. **格式**: **必须**是单一段落的文本。4. **目标**: 如果对话有实质内容，则创建记忆。否则，返回空字符串。"""
+FACT_EXTRACTION_PROMPT = """你正在帮助维护用户的"记忆"——就像一个个独立的"日记条目"。你将收到最近几条对话。你的任务是判断用户的【最新一条】消息中，有哪些细节值得作为"记忆"被长期保存。【核心指令】1.  **只分析用户最新一条消息**：仅从用户的最新发言中识别新的或变更的个人信息。旧消息仅供理解上下文。2.  **处理信息变更**：如果用户最新消息与旧信息冲突，只提取更新后的信息。3.  **事实独立**：每条记忆都应是独立的"事实"。如果一句话包含多个信息点，请拆分。4.  **提取有价值信息**：目标是捕捉任何有助于AI在未来提供更个性化服务的信息。5.  **响应明确指令**：如果用户明确要求"记住"，必须提取该信息。6.  **忽略短期信息**：不要记录临时或无意义的细节。7.  **指定格式返回**：将结果以【JSON字符串数组】的格式返回。如无信息，【只】返回空数组（`[]`）。不要加任何解释。---### 【示例】**示例 1**_输入对话:_- user: ```我爱吃橘子```- assistant: ```太棒了！```- user: ```其实我讨厌吃橘子```_正确输出:_["用户讨厌吃橘子"]**示例 2**_输入对话:_- user: ```我是一名初级数据分析师。请记住我的重要汇报在3月15日。```_正确输出:_["用户是一名初级数据分析师", "用户在3月15日有一次重要汇报"]"""
+SUMMARY_CREATION_PROMPT = """你是AI助手，任务是为一段对话生成简洁的摘要，作为长期记忆。【指令】1. **视角**: 以第一人称（"我"或"我们"）总结。2. **内容**: 捕捉核心要点：用户意图、你的关键回答、双方共识。3. **格式**: **必须**是单一段落的文本。4. **目标**: 如果对话有实质内容，则创建记忆。否则，返回空字符串。"""
 SUMMARY_UPDATE_PROMPT = """你的任务是根据最新的对话内容，更新一段已有的记忆摘要。【指令】1. 你将收到【旧的摘要】和【新的对话内容】。2. 将新对话中的【核心信息】无缝地融入到旧摘要中。3. 保持第一人称视角。4. **必须**返回一个更新后的、完整的、单一段落的摘要文本。【旧的摘要】:{existing_summary}【新的对话内容】:{new_conversation}"""
-FACT_CONSOLIDATION_PROMPT = """你正在管理用户的“记忆”。你的任务是清理一个可能包含相关、重叠或冲突信息的记忆列表。**【处理规则】**1. 你将收到一个JSON格式的记忆列表，每条含“fact”和“created_at”时间戳。2. 生成一个清理后的最终事实列表，确保： - 只在记忆**完全重复**或就同一主题**直接冲突**时才合并。 - 如果重复或冲突，**只保留`created_at`最新的那一条**。 - 如果部分相似但不冲突（例如“用户喜欢橘子”和“用户喜欢熟透的橘子”），则**两者都保留**。3. 返回最终结果时，使用一个简单的【JSON字符串数组】格式。不要添加任何解释。---### 【示例】_输入 (JSON数组):_`[{"fact": "用户最喜欢的颜色是青色", "created_at": 1635500000}, {"fact": "用户最喜欢的颜色是红色", "created_at": 1636000000}]`_正确输出 (JSON字符串数组):_["用户最喜欢的颜色是红色"]"""
-MEMORY_SUMMARIZATION_PROMPT = """你是一个记忆摘要助手。你的任务是将关于一个用户的多条相关但零散的记忆，合并成一个简洁、全面、高质量的摘要。**【核心指令】**1.  **整合信息**：捕获所有输入记忆中的关键信息点。2.  **解决冲突**：如果信息有矛盾，优先采纳时间戳最新的信息。3.  **消除冗余**：去除重复或无意义的细节。4.  **保持精华**：保留用户的核心偏好、身份特征、重要目标和关系。5.  **自然流畅**：最终输出的摘要应该像一段自然语言，而不是一个列表。6.  **格式要求**：【必须】只返回一个单一段落的文本摘要。不要加任何解释或多余的文字。**【示例】**_输入的多条记忆:_- "2024年05月10日11点：用户喜欢喝咖啡"- "2024年05月12日15点：用户偏好美式咖啡"- "2024年05月20日09点：用户提到他每天早上都要喝一杯咖啡提神"_正确的输出摘要:_"用户是一个咖啡爱好者，每天早上习惯喝一杯美式咖啡来提神。"现在，请分析以下的相关记忆，并提供一个简洁、高质量的摘要。"""
+FACT_CONSOLIDATION_PROMPT = """你正在管理用户的"记忆"。你的任务是清理一个可能包含相关、重叠或冲突信息的记忆列表。**【处理规则】**1. 你将收到一个JSON格式的记忆列表，每条含"fact"和"created_at"时间戳。2. 生成一个清理后的最终事实列表，确保： - 只在记忆**完全重复**或就同一主题**直接冲突**时才合并。 - 如果重复或冲突，**只保留`created_at`最新的那一条**。 - 如果部分相似但不冲突（例如"用户喜欢橘子"和"用户喜欢熟透的橘子"），则**两者都保留**。3. 返回最终结果时，使用一个简单的【JSON字符串数组】格式。不要添加任何解释。---### 【示例】_输入 (JSON数组):_`[{"fact": "用户最喜欢的颜色是青色", "created_at": 1635500000}, {"fact": "用户最喜欢的颜色是红色", "created_at": 1636000000}]`_正确输出 (JSON字符串数组):_["用户最喜欢的颜色是红色"]"""
+
+# 新增：用于总结超龄记忆的提示词
+OLD_MEMORY_SUMMARIZATION_PROMPT = """你是一个记忆整理助手。你的任务是将一组较旧的记忆整理成一个非常简短的综合性摘要。
+
+**【核心指令】**
+1. **时间范围**：这些记忆都是较早期的，需要整合成一个历史概览
+2. **保留要点**：保留所有重要的历史信息、偏好变化、关键事件
+3. **时间线索**：如果有明显的时间顺序或变化趋势，请在摘要中体现
+4. **格式要求**：返回一个自然流畅的段落，概括这段时期的用户信息
+
+现在，请分析以下的历史记忆，并提供一个综合性摘要："""
 
 
 # ==================== 主类定义 ====================
 class Filter:
     _embedding_model = None
-    _background_tasks = set()
 
     @classmethod
     def get_embedding_model(cls):
-        # ... (懒加载模型的代码保持不变) ...
         if cls._embedding_model is None:
             try:
                 print("Attempting to load SentenceTransformer model...")
@@ -71,7 +78,7 @@ class Filter:
         return cls._embedding_model
 
     class Valves(BaseModel):
-        # ... (配置与v4.6一致) ...
+        # 基础配置
         enabled: bool = Field(default=True, description="【总开关】启用/禁用本插件")
         memory_mode: str = Field(
             default="fact",
@@ -81,13 +88,31 @@ class Filter:
             default="https://api.openai.com/v1/chat/completions",
             description="API端点地址 (必须包含/v1/chat/completions)",
         )
-        api_key: str = Field(default="", description="【重要】API密钥")
-        model: str = Field(default="gpt-4o-mini", description="用于记忆处理的模型")
+        api_key: str = Field(
+            default="",
+            description="【重要】API密钥",
+        )
+        model: str = Field(default="gpt-4.1-nano", description="用于记忆处理的模型")
         show_stats: bool = Field(default=True, description="在状态栏显示性能与记忆统计")
         messages_to_consider: int = Field(default=6, description="纳入分析的消息数量")
         timezone: str = Field(
             default="Asia/Shanghai", description="【时间修正】用于生成时间戳的时区"
         )
+        # 记忆注入配置
+        inject_memories_to_prompt: bool = Field(
+            default=True, description="【记忆注入】是否将用户记忆注入到系统提示词中"
+        )
+        memory_injection_prepending_text: str = Field(
+            default="\n\n以下是存储记忆的列表。请将这些记忆中的信息视为事实，并用它们来指导你的回答，但除非与当前对话直接相关，否则不要提及记忆库中的信息。如果提供的记忆库为空，请不要编造记忆。这是记忆列表：",
+            description="注入记忆前的提示文本",
+        )
+        show_memory_count_in_status: bool = Field(
+            default=False, description="在状态栏显示注入的记忆数量"
+        )
+        append_on_empty_memories: bool = Field(
+            default=False, description="即使没有记忆也注入空的记忆列表"
+        )
+        # 语义搜索配置
         enable_semantic_search: bool = Field(
             default=False, description="【高级功能/可选】启用语义搜索"
         )
@@ -98,43 +123,99 @@ class Filter:
             default=0.75,
             description="【记忆整合】查找相关旧记忆以进行整合的相似度阈值 (0-1)",
         )
-        enable_background_summarization: bool = Field(
-            default=True, description="【后台任务】是否启用后台记忆自动摘要与整合"
-        )
-        summarization_interval_hours: float = Field(
-            default=2.0, description="【后台任务】每隔多少小时执行一次摘要任务"
-        )
-        summarization_cluster_threshold: float = Field(
-            default=0.7, description="【后台任务】判断记忆属于同一簇的相似度阈值"
-        )
-        summarization_min_cluster_size: int = Field(
-            default=3, description="【后台任务】形成一个簇所需的最少记忆数量"
-        )
-        summarization_min_memory_age_days: int = Field(
-            default=7, description="【后台任务】只对多少天以前的旧记忆进行摘要"
+        preserve_min_memory_age_days: int = Field(
+            default=3,
+            description="【记忆保留期】超过此天数的记忆将被总结后删除（0=禁用此功能）",
         )
 
     def __init__(self):
         self.valves = self.Valves()
         self.start_time = None
-        # 改造一：重新加入用于计算首字时间的变量
         self.time_to_first_token = None
         self.first_chunk_received = False
-        if self.valves.enable_background_summarization:
-            task = asyncio.create_task(self._summarize_memories_loop())
-            self._background_tasks.add(task)
-            task.add_done_callback(self._background_tasks.discard)
-            print("Background memory summarization task started.")
 
-    def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
+    async def inlet(
+        self,
+        body: dict,
+        __user__: Optional[dict] = None,
+        __event_emitter__: Optional[Callable[[dict], Any]] = None,
+    ) -> dict:
+        """处理输入，注入记忆到系统提示词"""
         self.start_time = time.time()
-        # 重置首字时间状态
         self.time_to_first_token = None
         self.first_chunk_received = False
+
+        # 如果启用了记忆注入功能
+        if self.valves.inject_memories_to_prompt and __user__:
+            user_id = __user__.get("id")
+            if user_id:
+                # 获取用户记忆
+                user_memories = Memories.get_memories_by_user_id(user_id)
+                num_memories = len(user_memories) if user_memories else 0
+
+                # 在状态栏显示记忆数量
+                if self.valves.show_memory_count_in_status and __event_emitter__:
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {
+                                "description": f"加载了 {num_memories} 条记忆",
+                                "status": "complete",
+                                "done": True,
+                            },
+                        }
+                    )
+
+                # 构建记忆列表
+                memory_list = []
+
+                if user_memories:
+                    for memory in user_memories:
+                        # 解析记忆内容，去除时间戳
+                        content_without_timestamp, _ = self._parse_memory_content(
+                            memory.content
+                        )
+
+                        updated_at = memory.updated_at
+                        if isinstance(updated_at, int):
+                            updated_at = datetime.datetime.fromtimestamp(updated_at)
+
+                        updated_at_str = updated_at.isoformat() if updated_at else None
+
+                        memory_list.append(
+                            {
+                                "content": content_without_timestamp,
+                                "updated_at": updated_at_str,
+                            }
+                        )
+
+                # 如果有记忆或者设置了即使空也要注入
+                if memory_list or self.valves.append_on_empty_memories:
+                    json_data = json.dumps(memory_list, ensure_ascii=False)
+                    system_message = (
+                        f"{self.valves.memory_injection_prepending_text}\n{json_data}"
+                    )
+
+                    # 查找并更新系统消息
+                    system_msg_found = False
+                    for message in body["messages"]:
+                        if message["role"] == "system":
+                            message["content"] += f"\n{system_message}"
+                            system_msg_found = True
+                            break
+
+                    # 如果没有系统消息，创建一个
+                    if not system_msg_found:
+                        body["messages"].insert(
+                            0, {"role": "system", "content": system_message}
+                        )
+
+                    print(f"Injected {num_memories} memories into system prompt")
+
         return body
 
-    # 改造一(续)：重新加入 stream 函数
     def stream(self, event: dict) -> dict:
+        """处理流式响应，记录首字时间"""
         if not self.first_chunk_received:
             self.time_to_first_token = time.time() - self.start_time
             self.first_chunk_received = True
@@ -146,10 +227,16 @@ class Filter:
         __event_emitter__: Callable[[Any], Awaitable[None]],
         __user__: Optional[dict] = None,
     ):
-        # ... (outlet函数保持不变) ...
+        """处理输出，执行记忆存储和统计"""
         if not self.valves.enabled or not __user__ or len(body.get("messages", [])) < 2:
             return body
+
         user = Users.get_user_by_id(__user__["id"])
+
+        # 处理超龄记忆（如果启用）
+        if self.valves.preserve_min_memory_age_days > 0:
+            await self._process_old_memories(user)
+
         try:
             if self.valves.memory_mode == "fact":
                 memory_result = await self._handle_fact_mode(body, user)
@@ -163,86 +250,73 @@ class Filter:
 
             traceback.print_exc()
             memory_result = {"status": "error", "message": "插件执行出错"}
+
         stats_result = self._calculate_stats(body)
+
         if self.valves.show_stats:
             await self._show_status(__event_emitter__, memory_result, stats_result)
+
         return body
 
-    # ... (所有后台任务、记忆处理等核心逻辑函数与 v4.6 完全一致, 此处省略) ...
-    # 为了完整性，粘贴所有函数
-    async def _summarize_memories_loop(self):
-        await asyncio.sleep(300)
-        while True:
-            interval_seconds = self.valves.summarization_interval_hours * 3600
-            print(
-                f"Next background summarization run in {self.valves.summarization_interval_hours} hours."
-            )
-            await asyncio.sleep(interval_seconds)
-            if not self.valves.enable_semantic_search:
-                print("Skipping summarization: Semantic search is disabled in valves.")
-                continue
-            try:
-                all_users = Users.get_users()
-                for user in all_users:
-                    await self._process_user_summarization(user)
-            except Exception as e:
-                print(f"Error in background summarization loop: {e}")
+    async def _process_old_memories(self, user):
+        """处理超龄记忆：总结并删除"""
+        try:
+            # 获取所有用户记忆
+            all_memories = Memories.get_memories_by_user_id(user.id)
+            if not all_memories:
+                return
 
-    async def _process_user_summarization(self, user):
-        print(f"Checking memories for user {user.id}...")
-        all_user_memories = await self._query_memories_by_similarity(
-            " ", user, k=1000, threshold=0.0
-        )
-        min_age_seconds = self.valves.summarization_min_memory_age_days * 24 * 3600
-        now_ts = time.time()
-        eligible_memories = [
-            mem
-            for mem in all_user_memories
-            if (now_ts - self._parse_memory_content(mem["content"])[1])
-            > min_age_seconds
-        ]
-        if len(eligible_memories) < self.valves.summarization_min_cluster_size:
-            print(f"User {user.id} has no eligible old memories to summarize.")
-            return
-        clusters, processed_ids = [], set()
-        for mem in eligible_memories:
-            if mem["id"] in processed_ids:
-                continue
-            current_cluster = [mem]
-            processed_ids.add(mem["id"])
-            related_mems = await self._query_memories_by_similarity(
-                mem["content_without_timestamp"],
-                user,
-                k=10,
-                threshold=self.valves.summarization_cluster_threshold,
-            )
-            for related in related_mems:
-                if related["id"] not in processed_ids and related["id"] in [
-                    m["id"] for m in eligible_memories
-                ]:
-                    current_cluster.append(related)
-                    processed_ids.add(related["id"])
-            if len(current_cluster) >= self.valves.summarization_min_cluster_size:
-                clusters.append(current_cluster)
-        if not clusters:
-            print(f"No memory clusters found for user {user.id}.")
-            return
-        print(f"Found {len(clusters)} clusters to summarize for user {user.id}.")
-        for cluster in clusters:
-            try:
-                cluster_content = "\n".join([f"- {m['content']}" for m in cluster])
-                summary_content = await self._call_llm(
-                    MEMORY_SUMMARIZATION_PROMPT, cluster_content
-                )
-                if summary_content:
-                    await self._store_new_memory(summary_content, user, is_summary=True)
-                    for m in cluster:
-                        await delete_memory_by_id(m["id"], user)
-                    print(
-                        f"Successfully summarized {len(cluster)} memories into one for user {user.id}."
+            # 计算时间阈值
+            min_age_seconds = self.valves.preserve_min_memory_age_days * 24 * 3600
+            now_ts = time.time()
+
+            # 筛选超龄记忆
+            old_memories = []
+            for mem in all_memories:
+                content, timestamp = self._parse_memory_content(mem.content)
+                if timestamp > 0 and (now_ts - timestamp) > min_age_seconds:
+                    old_memories.append(
+                        {
+                            "id": mem.id,
+                            "content": mem.content,
+                            "content_without_timestamp": content,
+                            "timestamp": timestamp,
+                        }
                     )
-            except Exception as e:
-                print(f"Error summarizing a cluster for user {user.id}: {e}")
+
+            if not old_memories:
+                return
+
+            print(
+                f"Found {len(old_memories)} old memories to process for user {user.id}"
+            )
+
+            # 构建记忆内容列表
+            memory_contents = [f"- {m['content']}" for m in old_memories]
+            combined_content = "\n".join(memory_contents)
+
+            # 调用LLM生成总结
+            summary = await self._call_llm(
+                OLD_MEMORY_SUMMARIZATION_PROMPT, combined_content
+            )
+
+            if summary:
+                # 存储总结作为新记忆
+                summary_with_note = (
+                    f"[历史记忆总结 - 包含{len(old_memories)}条记录] {summary}"
+                )
+                await self._store_new_memory(summary_with_note, user, is_summary=True)
+
+                # 删除旧记忆
+                for mem in old_memories:
+                    await delete_memory_by_id(mem["id"], user)
+
+                print(
+                    f"Successfully summarized and removed {len(old_memories)} old memories for user {user.id}"
+                )
+
+        except Exception as e:
+            print(f"Error processing old memories: {e}")
 
     async def _handle_fact_mode(self, body: dict, user) -> dict:
         conversation_text = self._stringify_conversation(body["messages"])
@@ -329,7 +403,6 @@ class Filter:
         except Exception as e:
             return {"status": "error", "message": f"总结处理失败: {e}"}
 
-    # 改造三：将时间戳格式精确到分钟
     def _add_timestamp_to_content(self, content: str) -> str:
         try:
             target_tz = pytz.timezone(self.valves.timezone)
@@ -367,14 +440,20 @@ class Filter:
         )
         return True
 
-    # 改造三(续)：修正解析和剥离时间戳的逻辑
-    def _parse_memory_content(self, content: str) -> (str, float):
+    def _parse_memory_content(self, content: str) -> tuple:
+        """解析记忆内容，返回(内容, 时间戳)"""
         match = re.match(r"^(\d{4}年\d{2}月\d{2}日\d{2}点\d{2}分)：(.*)", content)
         if match:
             try:
                 dt_obj = datetime.datetime.strptime(
-                    match.group(1), "%Y年%m月%d日%H点%M分："
+                    match.group(1), "%Y年%m月%d日%H点%M分"
                 )
+                # 应用时区
+                try:
+                    target_tz = pytz.timezone(self.valves.timezone)
+                except pytz.UnknownTimeZoneError:
+                    target_tz = pytz.utc
+                dt_obj = target_tz.localize(dt_obj)
                 return match.group(2), dt_obj.timestamp()
             except ValueError:
                 return match.group(2), 0
@@ -478,7 +557,6 @@ class Filter:
             [f"- {msg['role']}: {msg['content']}" for msg in messages[-count:]]
         )
 
-    # 改造一(续)：修改统计函数，加入首字时间
     def _calculate_stats(self, body: dict) -> dict:
         elapsed = time.time() - self.start_time
         response_msg = get_last_assistant_message(body.get("messages", [])) or ""
@@ -495,7 +573,6 @@ class Filter:
             ),
         }
 
-    # 改造二：修改显示函数，调整顺序并增加首字时间
     async def _show_status(
         self, event_emitter, memory_result: dict, stats_result: dict
     ):
@@ -514,7 +591,6 @@ class Filter:
             f"约{stats_result['tokens']}T",
         ]
 
-        # 按照您要的顺序组合
         final_parts = memory_part + stats_parts
 
         if final_parts:
